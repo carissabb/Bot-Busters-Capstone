@@ -564,18 +564,19 @@ int main(int argc, char *argv[]) {
         Ptr<Socket> socket = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
         clientSockets[i] = socket;
         
-        // Humans - bind to the WiFi interface to ensure it's used
-        //TODO need to put 5G here too
+        // For humans, create both WiFi and 5G sockets
         if (label == 1) {
+            // WiFi socket
             socket->BindToNetDevice(humanWifiDevices.Get(humanIdx));
-            NS_LOG_INFO("Human node socket bound to WiFi interface");
+            socket->Connect(remoteAddress);
+            NS_LOG_INFO("Human node " << clientNode->GetId() << " WiFi socket bound and connected");
 
             // 5G socket
             Ptr<Socket> socket5G = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
             socket5G->BindToNetDevice(humanUeDevices.Get(humanIdx));
             socket5G->Connect(remoteAddress);
             client5GSockets[i] = socket5G;
-            NS_LOG_INFO("Human node " << clientNode->GetId() << " 5G socket bound");
+            NS_LOG_INFO("Human node " << clientNode->GetId() << " 5G socket bound and connected");
             humanIdx++;
         } else {
             // Bots only use WiFi
