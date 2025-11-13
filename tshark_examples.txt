@@ -1,0 +1,14 @@
+tshark -r pcap_output/p2p-0-2.pcap -q -z io,phs
+
+===================================================================
+Protocol Hierarchy Statistics
+Filter: 
+
+ppp                                      frames:13043 bytes:4304381
+  ip                                     frames:13043 bytes:4304381
+    udp                                  frames:13043 bytes:4304381
+      gtpv2                              frames:22 bytes:5368
+      gtp                                frames:13021 bytes:4299013
+        ip                               frames:13021 bytes:4299013
+          tcp                            frames:13021 bytes:4299013
+===================================================================

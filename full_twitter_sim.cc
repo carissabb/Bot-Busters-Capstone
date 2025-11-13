@@ -26,6 +26,7 @@
 using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("TwitterNetworkSimulation");
 
+
 // Headers from twitter_data.csv
 struct TwitterData { 
     std::string username;
@@ -172,6 +173,27 @@ void SendPacket(Ptr<Socket> socket, Ipv4Address serverAddr, uint32_t serverPort,
     socket->Send(packet);
 }
 
+// Callback function to track mobility changes
+void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
+    if (g_nodeKPIs.find(nodeId) == g_nodeKPIs.end()) {
+        return;
+    }
+    
+    NodeKPI& kpi = g_nodeKPIs[nodeId];
+    Vector currentPos = model->GetPosition();
+    
+    // Calculate distance traveled since last position update
+    if (kpi.lastPosition != Vector(0, 0, 0)) {
+        double dx = currentPos.x - kpi.lastPosition.x;
+        double dy = currentPos.y - kpi.lastPosition.y;
+        double dz = currentPos.z - kpi.lastPosition.z;
+        double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        kpi.totalDistance += distance;
+    }
+    
+    kpi.lastPosition = currentPos;
+}
+
 // Output elasped time in seconds
 void PrintElapsedTime(std::chrono::time_point<std::chrono::high_resolution_clock> start) {
     auto now = std::chrono::high_resolution_clock::now();
@@ -301,6 +323,7 @@ int main(int argc, char *argv[]) {
     Ssid ssid = Ssid("bot-network");
 
     // Mobility for WiFi gateway 
+    //TODO: need to update the KPI for mobility
     MobilityHelper wifiMobility;
     Ptr<ListPositionAllocator> wifiGwPos = CreateObject<ListPositionAllocator>();
     wifiGwPos->Add(Vector(50.0, 50.0, 5.0)); 
@@ -458,6 +481,8 @@ int main(int argc, char *argv[]) {
 
     // Initialize KPIs
     int botIdx = 0, humanIdx = 0;
+
+    
     for (const auto& mapping : userMapping) {
         uint32_t nodeId;
         std::string networkType;
@@ -478,6 +503,15 @@ int main(int argc, char *argv[]) {
             // Map IP to node ID
             Ipv4Address addr = humanInterfaces.GetAddress(humanIdx);
             g_ipToNodeId[addr] = nodeId;
+            
+            // Set up mobility tracking for human nodes
+            Ptr<MobilityModel> mobility = humanNodes.Get(humanIdx)->GetObject<MobilityModel>();
+            if (mobility) {
+                g_nodeKPIs[nodeId].lastPosition = mobility->GetPosition();
+                mobility->TraceConnectWithoutContext("CourseChange",
+                    MakeBoundCallback(&CourseChangeCallback, nodeId));
+            }
+            
             humanIdx++;
         }
         
@@ -514,6 +548,7 @@ int main(int argc, char *argv[]) {
 
     // Create client sockets and schedule packets
     std::vector<Ptr<Socket>> clientSockets(usernames.size());
+    std::vector<Ptr<Socket>> client5GSockets(usernames.size());
     InetSocketAddress remoteAddress(serverIp, serverPort);
 
     botIdx = 0;
@@ -525,17 +560,28 @@ int main(int argc, char *argv[]) {
         const std::string &username = usernames[i];
         int label = userMapping[i].second;
 
-        Ptr<Node> clientNode = (label == 1) ? humanNodes.Get(humanIdx++) : botNodes.Get(botIdx++);
+        Ptr<Node> clientNode = (label == 1) ? humanNodes.Get(humanIdx) : botNodes.Get(botIdx);
         Ptr<Socket> socket = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
         clientSockets[i] = socket;
         
         // Humans - bind to the WiFi interface to ensure it's used
+        //TODO need to put 5G here too
         if (label == 1) {
-            socket->BindToNetDevice(humanWifiDevices.Get(humanIdx - 1));
+            socket->BindToNetDevice(humanWifiDevices.Get(humanIdx));
             NS_LOG_INFO("Human node socket bound to WiFi interface");
+
+            // 5G socket
+            Ptr<Socket> socket5G = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
+            socket5G->BindToNetDevice(humanUeDevices.Get(humanIdx));
+            socket5G->Connect(remoteAddress);
+            client5GSockets[i] = socket5G;
+            NS_LOG_INFO("Human node " << clientNode->GetId() << " 5G socket bound");
+            humanIdx++;
+        } else {
+            // Bots only use WiFi
+            socket->Connect(remoteAddress);
+            botIdx++;
         }
-        
-        socket->Connect(remoteAddress);
 
         // Count tweets for this user
         int tweetCount = 0;
@@ -560,8 +606,21 @@ int main(int argc, char *argv[]) {
                 pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(64, baseSize + jitter));
             }
             
-            Simulator::Schedule(Seconds(sendTime), &SendPacket, socket, serverIp, serverPort, pktSize);
-        }
+             // For humans, randomly choose between WiFi and 5G for each packet
+            if (label == 1) {
+                std::bernoulli_distribution networkChoice(0.5); // 50-50 chance
+                if (networkChoice(gen)) {
+                    // Use 5G
+                    Simulator::Schedule(Seconds(sendTime), &SendPacket, client5GSockets[i], serverIp, serverPort, pktSize);
+                } else {
+                    // Use WiFi
+                    Simulator::Schedule(Seconds(sendTime), &SendPacket, socket, serverIp, serverPort, pktSize);
+                }
+            } else {
+                // Bots always use WiFi
+                Simulator::Schedule(Seconds(sendTime), &SendPacket, socket, serverIp, serverPort, pktSize);
+            }      
+          }
         
         NS_LOG_INFO("User " << username << " (" << (label == 1 ? "human" : "bot") 
                     << "): scheduled " << tweetCount << " packets");
@@ -670,10 +729,10 @@ int main(int argc, char *argv[]) {
     }
 
     // Export KPI CSV idk here 
-    // TODO: need to find more meaningful KPIs
+    // TODO: need to find more meaningful KPIs, need useragent here
     NS_LOG_INFO("Exporting KPI data to " << csvFile);
     std::ofstream kpiFile(csvFile);
-    kpiFile << "NodeID,Username,NodeType,NetworkType,UserAgent,TxPackets,RxPackets,LostPackets,"
+    kpiFile << "NodeID,Username,NodeType,NetworkType,TxPackets,RxPackets,LostPackets,"
             << "PacketLossRate,TotalBytes,AvgDelay_ms,AvgJitter_ms,Throughput_bps,TotalDistance_m\n";
     
     for (auto& pair : g_nodeKPIs) {
