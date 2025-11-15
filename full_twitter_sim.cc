@@ -185,6 +185,67 @@ void SendPacket(Ptr<Socket> socket, Ipv4Address serverAddr, uint32_t serverPort,
     socket->Send(packet);
 }
 
+// Function to send Twitter packet based on node type and mobility
+void SendTwitterPacket(Ptr<Node> node,
+                  Ptr<Socket> wifiSocket,
+                  Ptr<Socket> socket5G,
+                  int label,                   
+                  uint32_t pktSize,
+                  Ipv4Address serverIp,
+                  uint16_t serverPort)
+{
+    if (!wifiSocket) {
+        return; 
+    }
+
+    uint32_t nodeId = node->GetId();
+    auto it = g_nodeKPIs.find(nodeId);
+    if (it == g_nodeKPIs.end())
+    {
+        SendPacket(wifiSocket, serverIp, serverPort, pktSize);
+        return;
+    }
+    NodeKPI &kpi = it->second;
+
+    Ptr<Socket> sockToUse = wifiSocket;
+    bool use5G = false;
+
+    if (label == 1 && socket5G) // humans only
+    {
+        Ptr<MobilityModel> mob = node->GetObject<MobilityModel>();
+        if (mob)
+        {
+            Vector vel = mob->GetVelocity();
+            double speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+
+            // moving vs stationary
+            if (speed > 0.3)
+            {
+                use5G = true;
+                sockToUse = socket5G;
+            }
+        }
+    }
+    // Update planned packet counts
+    if (label == 1) // human
+    {
+        if (use5G)
+        {
+            kpi.planned5gPackets++;
+        }
+        else
+        {
+            kpi.plannedWifiPackets++;
+        }
+    }
+    else // bot - WiFi only
+    {
+        kpi.plannedWifiPackets++;
+    }
+    SendPacket(sockToUse, serverIp, serverPort, pktSize);
+}
+
+
 // Callback function to track mobility changes
 void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
     if (g_nodeKPIs.find(nodeId) == g_nodeKPIs.end()) {
@@ -698,7 +759,7 @@ int main(int argc, char *argv[]) {
             // How many packets to send for this "tweet"
             int packetCount = isStorm ? stormCountDist(gen) : 1;
 
-            for (int p = 0; p < packetCount; ++p) {
+                for (int p = 0; p < packetCount; ++p) {
                 uint32_t pktSize;
 
                 if (label == 0) {
@@ -711,39 +772,21 @@ int main(int argc, char *argv[]) {
                     pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(64, baseSize + jitter));
                 }
 
-                bool use5G = false;
-
-                if (label == 1) {
-                    // Humans: choose WiFi vs 5G based on mobility (velocity)
-                    Ptr<MobilityModel> mob = clientNode->GetObject<MobilityModel>();
-                    if (mob) {
-                        Vector vel = mob->GetVelocity();
-                        double speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
-                        // Rough walking threshold
-                        if (speed > 0.3) {
-                            use5G = true;
-                        }
-                    }
-
-                    if (use5G && client5GSockets[i]) {
-                        Simulator::Schedule(Seconds(sendTime + p * 0.01),
-                            &SendPacket, client5GSockets[i], serverIp, serverPort, pktSize);
-                        kpi.planned5gPackets++;
-                    } else {
-                        Simulator::Schedule(Seconds(sendTime + p * 0.01),
-                            &SendPacket, socket, serverIp, serverPort, pktSize);
-                        kpi.plannedWifiPackets++;
-                    }
-                } else {
-                    // Bots: always WiFi
-                    Simulator::Schedule(Seconds(sendTime + p * 0.01),
-                        &SendPacket, socket, serverIp, serverPort, pktSize);
-                    kpi.plannedWifiPackets++;
-                }
+                // Schedule helper to choose WiFi vs 5G at send time
+                Simulator::Schedule(
+                    Seconds(sendTime + p * 0.01),
+                    &SendTwitterPacket,
+                    clientNode,
+                    socket,                      
+                    (label == 1 ? client5GSockets[i] : Ptr<Socket>(nullptr)), 
+                    label,
+                    pktSize,
+                    serverIp,
+                    serverPort
+                );
 
                 totalPacketsScheduled++;
             }
-
         }
 
         NS_LOG_INFO("User " << username << " (" << (label == 1 ? "human" : "bot")
@@ -833,7 +876,6 @@ int main(int argc, char *argv[]) {
             NodeKPI& kpi = g_nodeKPIs[nodeId];
 
             // Accumulate packet and byte counts
-            uint32_t prevTx = kpi.txPackets;
             uint32_t prevRx = kpi.rxPackets;
 
             kpi.txPackets += fs.txPackets;
