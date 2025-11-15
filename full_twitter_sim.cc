@@ -711,38 +711,15 @@ int main(int argc, char *argv[]) {
                     pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(64, baseSize + jitter));
                 }
 
-                // Humans: choose WiFi vs 5G based on mobility (velocity)
+                bool use5G = false;
+
                 if (label == 1) {
+                    // Humans: choose WiFi vs 5G based on mobility (velocity)
                     Ptr<MobilityModel> mob = clientNode->GetObject<MobilityModel>();
-                    bool use5G = false;
                     if (mob) {
                         Vector vel = mob->GetVelocity();
                         double speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
                         // Rough walking threshold
-                        if (speed > 0.3) {
-                            use5G = true;
-                        }
-                    }
-
-                    if (use5G && client5GSockets[i]) {
-                        Simulator::Schedule(Seconds(sendTime + p * 0.01),
-                            &SendPacket, client5GSockets[i], serverIp, serverPort, pktSize);
-                    } else {
-                        Simulator::Schedule(Seconds(sendTime + p * 0.01),
-                            &SendPacket, socket, serverIp, serverPort, pktSize);
-                    }
-                } else {
-                    // Bots: always WiFi
-                    Simulator::Schedule(Seconds(sendTime + p * 0.01),
-                        &SendPacket, socket, serverIp, serverPort, pktSize);
-                }
-                // Update KPI planned packets
-                if (label == 1) {
-                    Ptr<MobilityModel> mob = clientNode->GetObject<MobilityModel>();
-                    bool use5G = false;
-                    if (mob) {
-                        Vector vel = mob->GetVelocity();
-                        double speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
                         if (speed > 0.3) {
                             use5G = true;
                         }
@@ -763,8 +740,10 @@ int main(int argc, char *argv[]) {
                         &SendPacket, socket, serverIp, serverPort, pktSize);
                     kpi.plannedWifiPackets++;
                 }
+
                 totalPacketsScheduled++;
             }
+
         }
 
         NS_LOG_INFO("User " << username << " (" << (label == 1 ? "human" : "bot")
@@ -843,38 +822,69 @@ int main(int argc, char *argv[]) {
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
     std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
 
-    // Update KPIs from flow monitor stats
+    // Update KPIs from flow monitor stats (aggregate across flows per node)
     for (auto& flow : stats) {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
         FlowMonitor::FlowStats& fs = flow.second;
         
-        if (g_ipToNodeId.find(t.sourceAddress) != g_ipToNodeId.end()) {
-            uint32_t nodeId = g_ipToNodeId[t.sourceAddress];
+        auto it = g_ipToNodeId.find(t.sourceAddress);
+        if (it != g_ipToNodeId.end()) {
+            uint32_t nodeId = it->second;
             NodeKPI& kpi = g_nodeKPIs[nodeId];
-            
-            kpi.txPackets = fs.txPackets;
-            kpi.rxPackets = fs.rxPackets;
-            kpi.lostPackets = fs.lostPackets;
-            kpi.totalPackets = fs.txPackets;
-            kpi.totalBytes = fs.txBytes;
-            
-            if (fs.txPackets > 0) {
-                kpi.packetLossRate = static_cast<double>(fs.lostPackets) / fs.txPackets;
-            }
-            
+
+            // Accumulate packet and byte counts
+            uint32_t prevTx = kpi.txPackets;
+            uint32_t prevRx = kpi.rxPackets;
+
+            kpi.txPackets += fs.txPackets;
+            kpi.rxPackets += fs.rxPackets;
+            kpi.lostPackets += fs.lostPackets;
+            kpi.totalPackets = kpi.txPackets;
+            kpi.totalBytes += fs.txBytes;
+
+            // Weighted average delay/jitter over all flows for this node
             if (fs.rxPackets > 0) {
-                kpi.avgDelay = (fs.delaySum.GetSeconds() / fs.rxPackets) * 1000.0; // ms
+                double flowAvgDelayMs =
+                    (fs.delaySum.GetSeconds() / fs.rxPackets) * 1000.0;
+                double flowAvgJitterMs = 0.0;
                 if (fs.rxPackets > 1) {
-                    kpi.avgJitter = (fs.jitterSum.GetSeconds() / (fs.rxPackets - 1)) * 1000.0; // ms
+                    flowAvgJitterMs =
+                        (fs.jitterSum.GetSeconds() / (fs.rxPackets - 1)) * 1000.0;
                 }
-            }
-            
-            if (fs.timeLastRxPacket > fs.timeFirstTxPacket) {
-                kpi.throughput = (fs.rxBytes * 8.0) /
-                    (fs.timeLastRxPacket.GetSeconds() - fs.timeFirstTxPacket.GetSeconds());
+
+                uint32_t newRx = prevRx + fs.rxPackets;
+                if (newRx == fs.rxPackets) {
+                    // First time we see this node
+                    kpi.avgDelay = flowAvgDelayMs;
+                    kpi.avgJitter = flowAvgJitterMs;
+                } else {
+                    // Combine old + new using weighted average by rxPackets
+                    kpi.avgDelay =
+                        (kpi.avgDelay * prevRx + flowAvgDelayMs * fs.rxPackets) /
+                        static_cast<double>(newRx);
+                    kpi.avgJitter =
+                        (kpi.avgJitter * prevRx + flowAvgJitterMs * fs.rxPackets) /
+                        static_cast<double>(newRx);
+                }
             }
         }
     }
+
+    // Finalize packet loss rate and throughput per node
+    for (auto& pair : g_nodeKPIs) {
+        NodeKPI& kpi = pair.second;
+
+        if (kpi.txPackets > 0) {
+            kpi.packetLossRate =
+                static_cast<double>(kpi.lostPackets) / static_cast<double>(kpi.txPackets);
+        }
+
+        if (kpi.rxPackets > 0 && simDuration > 0.0) {
+            // Approximate throughput over the simulation window
+            kpi.throughput = (kpi.totalBytes * 8.0) / simDuration;
+        }
+    }
+
 
     // Export KPI CSV idk here 
     // TODO: need to find more meaningful KPIs, need useragent here
