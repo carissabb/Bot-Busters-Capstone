@@ -69,6 +69,7 @@ struct NodeKPI {
     // Mobility
     double totalDistance;
     Vector lastPosition;
+    bool hasLastPos = false;
     
     NodeKPI()
         : nodeId(0),
@@ -187,59 +188,63 @@ void SendPacket(Ptr<Socket> socket, Ipv4Address serverAddr, uint32_t serverPort,
 
 // Function to send Twitter packet based on node type and mobility
 void SendTwitterPacket(Ptr<Node> node,
-                  Ptr<Socket> wifiSocket,
-                  Ptr<Socket> socket5G,
-                  int label,                   
-                  uint32_t pktSize,
-                  Ipv4Address serverIp,
-                  uint16_t serverPort)
+                       Ptr<Socket> wifiSocket,
+                       Ptr<Socket> socket5G,
+                       int label,                    
+                       uint32_t pktSize,
+                       Ipv4Address serverIp,
+                       uint16_t serverPort)          
 {
-    if (!wifiSocket) {
-        return; 
-    }
+    if (!wifiSocket) return;
 
     uint32_t nodeId = node->GetId();
+
+    // Retrieve KPI entry
     auto it = g_nodeKPIs.find(nodeId);
-    if (it == g_nodeKPIs.end())
-    {
+    if (it == g_nodeKPIs.end()) {
+        // If no KPI object, send on WiFi
         SendPacket(wifiSocket, serverIp, serverPort, pktSize);
         return;
     }
+
     NodeKPI &kpi = it->second;
 
+    //  Decide which socket to use
     Ptr<Socket> sockToUse = wifiSocket;
+    
+    if (label == 0) { // Bots NEVER use 5G
+        socket5G = nullptr;
+    }
+
     bool use5G = false;
 
-    if (label == 1 && socket5G) // humans only
+    // Choose wifi or 5g for humans based on mobility
+    if (label == 1 && socket5G)  // humans only
     {
         Ptr<MobilityModel> mob = node->GetObject<MobilityModel>();
         if (mob)
         {
             Vector vel = mob->GetVelocity();
-            double speed = std::sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
+            double speed = std::sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z);
 
-            // moving vs stationary
-            if (speed > 0.3)
-            {
+            // movement-based switching
+            if (speed > 1.0) {
                 use5G = true;
-                sockToUse = socket5G;
             }
         }
     }
-    // Update planned packet counts
-    if (label == 1) // human
-    {
-        if (use5G)
-        {
-            kpi.planned5gPackets++;
-        }
-        else
-        {
-            kpi.plannedWifiPackets++;
-        }
+
+    // Select socket and update KPI counters
+    if (use5G) {
+        sockToUse = socket5G;
+    } else {
+        sockToUse = wifiSocket;
     }
-    else // bot - WiFi only
-    {
+
+    // update kpi counters based on socket used
+    if (sockToUse == socket5G) {
+        kpi.planned5gPackets++;
+    } else {
         kpi.plannedWifiPackets++;
     }
     SendPacket(sockToUse, serverIp, serverPort, pktSize);
@@ -248,11 +253,12 @@ void SendTwitterPacket(Ptr<Node> node,
 
 // Callback function to track mobility changes
 void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
-    if (g_nodeKPIs.find(nodeId) == g_nodeKPIs.end()) {
+    auto it = g_nodeKPIs.find(nodeId);
+    if (it == g_nodeKPIs.end()) {
         return;
     }
-    
-    NodeKPI& kpi = g_nodeKPIs[nodeId];
+
+    NodeKPI& kpi = it->second;
     Vector currentPos = model->GetPosition();
     
     // Calculate distance traveled since last position update
@@ -265,6 +271,7 @@ void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
     }
     
     kpi.lastPosition = currentPos;
+    kpi.hasLastPos = true;
 }
 
 // Output elasped time in seconds
@@ -447,10 +454,11 @@ int main(int argc, char *argv[]) {
                                       "Y", StringValue("ns3::UniformRandomVariable[Min=0|Max=200]"),
                                       "Z", StringValue("ns3::ConstantRandomVariable[Constant=1.5]"));
     humanMobility.SetMobilityModel("ns3::RandomWalk2dMobilityModel",
-                                  "Mode", StringValue("Time"),
-                                  "Time", StringValue("2s"),
-                                  "Speed", StringValue("ns3::UniformRandomVariable[Min=1.0|Max=2.0]"),
-                                  "Bounds", RectangleValue(Rectangle(0, 200, 0, 200)));
+                                "Mode", StringValue("Time"),
+                                "Time", StringValue("2s"),
+                                "Speed", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=1.5]"),
+                                "Bounds", RectangleValue(Rectangle(0, 200, 0, 200)));
+
     humanMobility.Install(humanNodes);
 
     // Create NR bandwidth parts
@@ -769,7 +777,7 @@ int main(int argc, char *argv[]) {
                 } else {
                     // Humans: more variable packet size
                     uint32_t jitter = humanJitterDist(gen);
-                    pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(64, baseSize + jitter));
+                    pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(200, baseSize + jitter));
                 }
 
                 // Schedule helper to choose WiFi vs 5G at send time
