@@ -52,6 +52,14 @@ struct NodeKPI {
     uint32_t lostPackets;
     double packetLossRate;
     uint64_t totalBytes;
+
+    // Behavioral features
+    uint32_t tweetCount;          
+    uint32_t stormTweetCount;     
+    double   avgIatReal;         
+    double   stdIatReal;          
+    uint32_t plannedWifiPackets; 
+    uint32_t planned5gPackets;
     
     // Network characteristics
     double avgDelay;
@@ -61,11 +69,16 @@ struct NodeKPI {
     // Mobility
     double totalDistance;
     Vector lastPosition;
+    bool hasLastPos = false;
     
-   
-    NodeKPI() : nodeId(0), totalPackets(0), txPackets(0), rxPackets(0),
-                lostPackets(0), packetLossRate(0), totalBytes(0),
-                avgDelay(0), avgJitter(0), throughput(0), totalDistance(0) {
+    NodeKPI()
+        : nodeId(0),
+          totalPackets(0), txPackets(0), rxPackets(0),
+          lostPackets(0), packetLossRate(0), totalBytes(0),
+          tweetCount(0), stormTweetCount(0),
+          avgIatReal(0.0), stdIatReal(0.0),
+          plannedWifiPackets(0), planned5gPackets(0),
+          avgDelay(0), avgJitter(0), throughput(0), totalDistance(0) {
         lastPosition = Vector(0, 0, 0);
     }
 };
@@ -173,13 +186,79 @@ void SendPacket(Ptr<Socket> socket, Ipv4Address serverAddr, uint32_t serverPort,
     socket->Send(packet);
 }
 
-// Callback function to track mobility changes
-void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
-    if (g_nodeKPIs.find(nodeId) == g_nodeKPIs.end()) {
+// Function to send Twitter packet based on node type and mobility
+void SendTwitterPacket(Ptr<Node> node,
+                       Ptr<Socket> wifiSocket,
+                       Ptr<Socket> socket5G,
+                       int label,                    
+                       uint32_t pktSize,
+                       Ipv4Address serverIp,
+                       uint16_t serverPort)          
+{
+    if (!wifiSocket) return;
+
+    uint32_t nodeId = node->GetId();
+
+    // Retrieve KPI entry
+    auto it = g_nodeKPIs.find(nodeId);
+    if (it == g_nodeKPIs.end()) {
+        // If no KPI object, send on WiFi
+        SendPacket(wifiSocket, serverIp, serverPort, pktSize);
         return;
     }
+
+    NodeKPI &kpi = it->second;
+
+    //  Decide which socket to use
+    Ptr<Socket> sockToUse = wifiSocket;
     
-    NodeKPI& kpi = g_nodeKPIs[nodeId];
+    if (label == 0) { // Bots NEVER use 5G
+        socket5G = nullptr;
+    }
+
+    bool use5G = false;
+
+    // Choose wifi or 5g for humans based on mobility
+    if (label == 1 && socket5G)  // humans only
+    {
+        Ptr<MobilityModel> mob = node->GetObject<MobilityModel>();
+        if (mob)
+        {
+            Vector vel = mob->GetVelocity();
+            double speed = std::sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z);
+
+            // movement-based switching
+            if (speed > 1.0) {
+                use5G = true;
+            }
+        }
+    }
+
+    // Select socket and update KPI counters
+    if (use5G) {
+        sockToUse = socket5G;
+    } else {
+        sockToUse = wifiSocket;
+    }
+
+    // update kpi counters based on socket used
+    if (sockToUse == socket5G) {
+        kpi.planned5gPackets++;
+    } else {
+        kpi.plannedWifiPackets++;
+    }
+    SendPacket(sockToUse, serverIp, serverPort, pktSize);
+}
+
+
+// Callback function to track mobility changes
+void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
+    auto it = g_nodeKPIs.find(nodeId);
+    if (it == g_nodeKPIs.end()) {
+        return;
+    }
+
+    NodeKPI& kpi = it->second;
     Vector currentPos = model->GetPosition();
     
     // Calculate distance traveled since last position update
@@ -192,6 +271,7 @@ void CourseChangeCallback(uint32_t nodeId, Ptr<const MobilityModel> model) {
     }
     
     kpi.lastPosition = currentPos;
+    kpi.hasLastPos = true;
 }
 
 // Output elasped time in seconds
@@ -374,10 +454,11 @@ int main(int argc, char *argv[]) {
                                       "Y", StringValue("ns3::UniformRandomVariable[Min=0|Max=200]"),
                                       "Z", StringValue("ns3::ConstantRandomVariable[Constant=1.5]"));
     humanMobility.SetMobilityModel("ns3::RandomWalk2dMobilityModel",
-                                  "Mode", StringValue("Time"),
-                                  "Time", StringValue("2s"),
-                                  "Speed", StringValue("ns3::UniformRandomVariable[Min=1.0|Max=2.0]"),
-                                  "Bounds", RectangleValue(Rectangle(0, 200, 0, 200)));
+                                "Mode", StringValue("Time"),
+                                "Time", StringValue("2s"),
+                                "Speed", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=1.5]"),
+                                "Bounds", RectangleValue(Rectangle(0, 200, 0, 200)));
+
     humanMobility.Install(humanNodes);
 
     // Create NR bandwidth parts
@@ -449,22 +530,38 @@ int main(int argc, char *argv[]) {
 
     // Human routing through both WiFi and 5G
     for (uint32_t i = 0; i < humanNodes.GetN(); ++i) {
-        auto s = rt.GetStaticRouting(humanNodes.Get(i)->GetObject<Ipv4>());
-        
-        // Set default route through WiFi
-        s->SetDefaultRoute(botApInterfaces.GetAddress(0), 2);
-        
-        // Add specific route through 5G
-        s->AddHostRouteTo(serverIp, epcHelper->GetUeDefaultGatewayAddress(), 1);
-        
-        // Register both IPs for KPI tracking
-        g_ipToNodeId[humanWifiInterfaces.GetAddress(i)] = humanNodes.Get(i)->GetId();
-        g_ipToNodeId[humanInterfaces.GetAddress(i)] = humanNodes.Get(i)->GetId();
-        
-        NS_LOG_INFO("Human node " << humanNodes.Get(i)->GetId() 
-                    << " has WiFi IP " << humanWifiInterfaces.GetAddress(i)
-                    << " and 5G IP " << humanInterfaces.GetAddress(i));
+        Ptr<Node> hNode = humanNodes.Get(i);
+        Ptr<Ipv4> ipv4 = hNode->GetObject<Ipv4>();
+        auto s = rt.GetStaticRouting(ipv4);
+
+        // Get interface index for WiFi + 5G devices
+        uint32_t ifIndexWifi = ipv4->GetInterfaceForDevice(humanWifiDevices.Get(i));
+        uint32_t ifIndex5G   = ipv4->GetInterfaceForDevice(humanUeDevices.Get(i));
+
+        // Get next hops
+        Ipv4Address wifiGwAddr = botApInterfaces.GetAddress(0);                   
+        Ipv4Address epcGwAddr  = epcHelper->GetUeDefaultGatewayAddress();         
+
+        // Default route -> WiFi (for general traffic)
+        s->SetDefaultRoute(wifiGwAddr, ifIndexWifi);
+
+        // Host route to server via WiFi
+        s->AddHostRouteTo(serverIp, wifiGwAddr, ifIndexWifi);
+
+        // Host route to server via 5G
+        s->AddHostRouteTo(serverIp, epcGwAddr, ifIndex5G);
+
+        // Register IPs for KPI tracking
+        g_ipToNodeId[humanWifiInterfaces.GetAddress(i)] = hNode->GetId();
+        g_ipToNodeId[humanInterfaces.GetAddress(i)] = hNode->GetId();
+
+        NS_LOG_INFO("Human node " << hNode->GetId()
+            << " WiFi-ifIndex=" << ifIndexWifi
+            << " 5G-ifIndex=" << ifIndex5G
+            << " WiFi-GW=" << wifiGwAddr
+            << " EPC-GW=" << epcGwAddr);
     }
+
     
     // Gateway routing
     auto gwStatic = rt.GetStaticRouting(wifiGw.Get(0)->GetObject<Ipv4>());
@@ -563,7 +660,11 @@ int main(int argc, char *argv[]) {
         Ptr<Node> clientNode = (label == 1) ? humanNodes.Get(humanIdx) : botNodes.Get(botIdx);
         Ptr<Socket> socket = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
         clientSockets[i] = socket;
-        
+
+        // Reference KPI entry for this node
+        uint32_t nodeId = clientNode->GetId();
+        NodeKPI &kpi = g_nodeKPIs[nodeId];
+
         // For humans, create both WiFi and 5G sockets
         if (label == 1) {
             // WiFi socket
@@ -584,48 +685,124 @@ int main(int argc, char *argv[]) {
             botIdx++;
         }
 
-        // Count tweets for this user
-        int tweetCount = 0;
+        // Build current user tweet list
+        std::vector<TwitterData> userTweets;
         for (const auto &twt : tweets) {
-            if (twt.username != username) continue;
-            tweetCount++;
-            
-            double absTime = ConvertTimestampToSeconds(twt.tweet_timestamp);
-            double normalizedTime = (absTime - firstTweetTime) / totalTimeSpan;
-            double sendTime = 1.0 + (normalizedTime * (simDuration - 2.0));
+            if (twt.username == username) {
+                userTweets.push_back(twt);
+            }
+        }
 
-            uint32_t textBytes = static_cast<uint32_t>(twt.tweet_text.size());
+        if (userTweets.empty()) {
+            NS_LOG_INFO("User " << username << " has no tweets, skipping scheduling");
+            continue;
+        }
+
+        // Sort this user's tweets by timestamp
+        std::sort(userTweets.begin(), userTweets.end(),
+                  [](const TwitterData &a, const TwitterData &b) {
+                      return ConvertTimestampToSeconds(a.tweet_timestamp) <
+                             ConvertTimestampToSeconds(b.tweet_timestamp);
+                  });
+
+        // Compute real interarrival times (IATs) between tweets
+        std::vector<double> iatReal;
+        for (size_t k = 1; k < userTweets.size(); ++k) {
+            double tPrev = ConvertTimestampToSeconds(userTweets[k - 1].tweet_timestamp);
+            double tCurr = ConvertTimestampToSeconds(userTweets[k].tweet_timestamp);
+            double diff = std::max(0.0, tCurr - tPrev);
+            iatReal.push_back(diff);
+        }
+
+        double sumIatReal = 0.0;
+        for (double v : iatReal) sumIatReal += v;
+        if (sumIatReal <= 0.0) {
+            sumIatReal = 1.0; // avoid divide-by-zero for single-tweet users
+        }
+
+        // Fill KPI tweet-level stats for this node
+        kpi.tweetCount = static_cast<uint32_t>(userTweets.size());
+        if (!iatReal.empty()) {
+            double meanIat = sumIatReal / static_cast<double>(iatReal.size());
+            double var = 0.0;
+            for (double v : iatReal) {
+                double d = v - meanIat;
+                var += d * d;
+            }
+            var /= static_cast<double>(iatReal.size());
+            kpi.avgIatReal = meanIat;
+            kpi.stdIatReal = std::sqrt(var);
+        }
+
+        // Small random offset so all users don't start at the exact same time
+        std::uniform_real_distribution<double> offsetDist(0.0, 0.5);
+        double sendTime = 1.0 + offsetDist(gen);
+
+        // Distributions for jitter and storm packet counts
+        std::uniform_int_distribution<uint32_t> humanJitterDist(0, 400);
+        std::uniform_int_distribution<int> stormCountDist(2, 5); // 2–5 packets in a storm
+
+        int totalPacketsScheduled = 0;
+
+        for (size_t k = 0; k < userTweets.size(); ++k) {
+            // Add scaled interarrival time for tweets after the first
+            if (k > 0 && !iatReal.empty()) {
+                double iatR = iatReal[k - 1];
+                double iatSim = (iatR / sumIatReal) * (simDuration - 2.0);
+                sendTime += iatSim;
+            }
+
+            // Tweet storm detection: very small real-world IAT
+            bool isStorm = (k > 0 && !iatReal.empty() && iatReal[k - 1] < 3.0);
+            // Update KPI
+            if (isStorm) {
+                kpi.stormTweetCount++;
+            }
+
+            // Base packet size from tweet text
+            uint32_t textBytes = static_cast<uint32_t>(userTweets[k].tweet_text.size());
             uint32_t headerBytes = 40;
             uint32_t baseSize = headerBytes + textBytes;
 
-            uint32_t pktSize;
-            if (label == 0) { 
-                pktSize = std::min<uint32_t>(512, std::max<uint32_t>(64, baseSize));
-            } else { 
-                std::uniform_int_distribution<uint32_t> jitterDist(0, 400);
-                uint32_t jitter = jitterDist(gen);
-                pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(64, baseSize + jitter));
-            }
-            
-             // For humans, randomly choose between WiFi and 5G for each packet
-            if (label == 1) {
-                std::bernoulli_distribution networkChoice(0.5); // 50-50 chance
-                if (networkChoice(gen)) {
-                    // Use 5G
-                    Simulator::Schedule(Seconds(sendTime), &SendPacket, client5GSockets[i], serverIp, serverPort, pktSize);
+            // How many packets to send for this "tweet"
+            int packetCount = isStorm ? stormCountDist(gen) : 1;
+
+                for (int p = 0; p < packetCount; ++p) {
+                uint32_t pktSize;
+
+                if (label == 0) {
+                    // Bots: more uniform packet size, small fixed jitter
+                    uint32_t jitter = 20;
+                    pktSize = std::min<uint32_t>(512, std::max<uint32_t>(64, baseSize + jitter));
                 } else {
-                    // Use WiFi
-                    Simulator::Schedule(Seconds(sendTime), &SendPacket, socket, serverIp, serverPort, pktSize);
+                    // Humans: more variable packet size
+                    uint32_t jitter = humanJitterDist(gen);
+                    pktSize = std::min<uint32_t>(1500, std::max<uint32_t>(200, baseSize + jitter));
                 }
-            } else {
-                // Bots always use WiFi
-                Simulator::Schedule(Seconds(sendTime), &SendPacket, socket, serverIp, serverPort, pktSize);
-            }      
-          }
-        
-        NS_LOG_INFO("User " << username << " (" << (label == 1 ? "human" : "bot") 
-                    << "): scheduled " << tweetCount << " packets");
+
+                // Schedule helper to choose WiFi vs 5G at send time
+                Simulator::Schedule(
+                    Seconds(sendTime + p * 0.01),
+                    &SendTwitterPacket,
+                    clientNode,
+                    socket,                      
+                    (label == 1 ? client5GSockets[i] : Ptr<Socket>(nullptr)), 
+                    label,
+                    pktSize,
+                    serverIp,
+                    serverPort
+                );
+
+                totalPacketsScheduled++;
+            }
+        }
+
+        NS_LOG_INFO("User " << username << " (" << (label == 1 ? "human" : "bot")
+                    << "): scheduled " << totalPacketsScheduled
+                    << " packets from " << userTweets.size() << " tweets");
     }
+
+    
 
     // Setup NetAnim
     NS_LOG_INFO("Setting up NetAnim...");
@@ -696,46 +873,78 @@ int main(int argc, char *argv[]) {
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
     std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
 
-    // Update KPIs from flow monitor stats
+    // Update KPIs from flow monitor stats (aggregate across flows per node)
     for (auto& flow : stats) {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
         FlowMonitor::FlowStats& fs = flow.second;
         
-        if (g_ipToNodeId.find(t.sourceAddress) != g_ipToNodeId.end()) {
-            uint32_t nodeId = g_ipToNodeId[t.sourceAddress];
+        auto it = g_ipToNodeId.find(t.sourceAddress);
+        if (it != g_ipToNodeId.end()) {
+            uint32_t nodeId = it->second;
             NodeKPI& kpi = g_nodeKPIs[nodeId];
-            
-            kpi.txPackets = fs.txPackets;
-            kpi.rxPackets = fs.rxPackets;
-            kpi.lostPackets = fs.lostPackets;
-            kpi.totalPackets = fs.txPackets;
-            kpi.totalBytes = fs.txBytes;
-            
-            if (fs.txPackets > 0) {
-                kpi.packetLossRate = static_cast<double>(fs.lostPackets) / fs.txPackets;
-            }
-            
+
+            // Accumulate packet and byte counts
+            uint32_t prevRx = kpi.rxPackets;
+
+            kpi.txPackets += fs.txPackets;
+            kpi.rxPackets += fs.rxPackets;
+            kpi.lostPackets += fs.lostPackets;
+            kpi.totalPackets = kpi.txPackets;
+            kpi.totalBytes += fs.txBytes;
+
+            // Weighted average delay/jitter over all flows for this node
             if (fs.rxPackets > 0) {
-                kpi.avgDelay = (fs.delaySum.GetSeconds() / fs.rxPackets) * 1000.0; // ms
+                double flowAvgDelayMs =
+                    (fs.delaySum.GetSeconds() / fs.rxPackets) * 1000.0;
+                double flowAvgJitterMs = 0.0;
                 if (fs.rxPackets > 1) {
-                    kpi.avgJitter = (fs.jitterSum.GetSeconds() / (fs.rxPackets - 1)) * 1000.0; // ms
+                    flowAvgJitterMs =
+                        (fs.jitterSum.GetSeconds() / (fs.rxPackets - 1)) * 1000.0;
                 }
-            }
-            
-            if (fs.timeLastRxPacket > fs.timeFirstTxPacket) {
-                kpi.throughput = (fs.rxBytes * 8.0) /
-                    (fs.timeLastRxPacket.GetSeconds() - fs.timeFirstTxPacket.GetSeconds());
+
+                uint32_t newRx = prevRx + fs.rxPackets;
+                if (newRx == fs.rxPackets) {
+                    // First time we see this node
+                    kpi.avgDelay = flowAvgDelayMs;
+                    kpi.avgJitter = flowAvgJitterMs;
+                } else {
+                    // Combine old + new using weighted average by rxPackets
+                    kpi.avgDelay =
+                        (kpi.avgDelay * prevRx + flowAvgDelayMs * fs.rxPackets) /
+                        static_cast<double>(newRx);
+                    kpi.avgJitter =
+                        (kpi.avgJitter * prevRx + flowAvgJitterMs * fs.rxPackets) /
+                        static_cast<double>(newRx);
+                }
             }
         }
     }
+
+    // Finalize packet loss rate and throughput per node
+    for (auto& pair : g_nodeKPIs) {
+        NodeKPI& kpi = pair.second;
+
+        if (kpi.txPackets > 0) {
+            kpi.packetLossRate =
+                static_cast<double>(kpi.lostPackets) / static_cast<double>(kpi.txPackets);
+        }
+
+        if (kpi.rxPackets > 0 && simDuration > 0.0) {
+            // Approximate throughput over the simulation window
+            kpi.throughput = (kpi.totalBytes * 8.0) / simDuration;
+        }
+    }
+
 
     // Export KPI CSV idk here 
     // TODO: need to find more meaningful KPIs, need useragent here
     NS_LOG_INFO("Exporting KPI data to " << csvFile);
     std::ofstream kpiFile(csvFile);
-    kpiFile << "NodeID,Username,NodeType,NetworkType,TxPackets,RxPackets,LostPackets,"
-            << "PacketLossRate,TotalBytes,AvgDelay_ms,AvgJitter_ms,Throughput_bps,TotalDistance_m\n";
-    
+    kpiFile << "NodeID,Username,NodeType,NetworkType,"
+            << "TxPackets,RxPackets,LostPackets,PacketLossRate,TotalBytes,"
+            << "TweetCount,StormTweetCount,AvgIAT_s,StdIAT_s,PlannedWifiPkts,Planned5GPkts,"
+            << "AvgDelay_ms,AvgJitter_ms,Throughput_bps,TotalDistance_m\n";
+
     for (auto& pair : g_nodeKPIs) {
         NodeKPI& kpi = pair.second;
         kpiFile << kpi.nodeId << ","
@@ -747,6 +956,12 @@ int main(int argc, char *argv[]) {
                 << kpi.lostPackets << ","
                 << kpi.packetLossRate << ","
                 << kpi.totalBytes << ","
+                << kpi.tweetCount << ","
+                << kpi.stormTweetCount << ","
+                << kpi.avgIatReal << ","
+                << kpi.stdIatReal << ","
+                << kpi.plannedWifiPackets << ","
+                << kpi.planned5gPackets << ","
                 << kpi.avgDelay << ","
                 << kpi.avgJitter << ","
                 << kpi.throughput << ","
