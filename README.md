@@ -37,6 +37,7 @@ scratch/
 └── Twitter_Data.csv
 ```
 
+Both files must be placed inside the ns-3 `scratch/` directory for the simulation to compile and run correctly.
 
 ---
 
