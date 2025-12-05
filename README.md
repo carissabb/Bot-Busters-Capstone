@@ -96,17 +96,3 @@ Additional outputs:
 ```bash
 ./ns3 run "full_twitter_sim --maxUsers=10"
 ```
-
-## Customization
-Edit `full_twitter_sim.cc` to adjust:
-
-- Simulation duration  
-- Mobility parameters  
-- Wi-Fi / 5G configuration  
-- Packet size jitter  
-- Tweet storm threshold  
-
-The number of users is controlled at runtime using:
-
-`--maxUsers`
-
