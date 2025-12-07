@@ -22,6 +22,19 @@ All tweet activity is generated from real timestamps by converting them into int
 
 ---
 
+## System Requirements
+
+These are the dependencies used for this project:
+
+- **NS3** — 3.45 (not allinone)
+- **Ubuntu** — 24.04
+- **WSL** — WSL2
+- **VSCode**
+
+By default NS3 works in C++ so there is no need to additionally install it.
+
+---
+
 ## Input Data & Project Structure
 
 **Required input file:**
