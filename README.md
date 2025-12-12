@@ -109,3 +109,14 @@ Additional outputs:
 ```bash
 ./ns3 run "full_twitter_sim --maxUsers=10"
 ```
+## Viewing the Results
+Using the notebook in this repository, users will be able to create visualizations based on the outputted bot_detection_kpis.csv file from the sim. Below are commands to get started and run the code in the Jupyter Notebook.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+
+
