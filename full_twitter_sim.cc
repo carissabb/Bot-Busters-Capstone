@@ -26,7 +26,6 @@
 using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("TwitterNetworkSimulation");
 
-
 // Headers from twitter_data.csv
 struct TwitterData { 
     std::string username;
@@ -296,13 +295,19 @@ int main(int argc, char *argv[]) {
     std::string pcapDir = "pcap_output";
     std::string csvFile = "bot_detection_kpis.csv";
     std::string animFile = "twitter-bot-detection.xml";
-    uint32_t maxUsers = 20; // Default - limit to 20 users - edit using cli command --maxUsers=x
+    uint32_t maxUsers = 20;
+    std::string inputCsv = "scratch/Twitter_Data.csv";
+    bool enableTracing = false;
+    bool enableNetAnim = false;  // Disabled by default - uses lots of memory
     
     CommandLine cmd(__FILE__);
     cmd.AddValue("pcapDir", "Directory for PCAP files", pcapDir);
     cmd.AddValue("csvFile", "Output CSV file for KPIs", csvFile);
+    cmd.AddValue("input", "Input CSV file for tweets (overrides default)", inputCsv);
     cmd.AddValue("animFile", "Output NetAnim XML file", animFile);
     cmd.AddValue("maxUsers", "Maximum number of users to simulate", maxUsers);
+    cmd.AddValue("enableTracing", "Enable PCAP and NR tracing (slower)", enableTracing);
+    cmd.AddValue("enableNetAnim", "Enable NetAnim output (uses memory)", enableNetAnim);
     cmd.Parse(argc, argv);
 
     CreateDirectory(pcapDir);
@@ -312,7 +317,9 @@ int main(int argc, char *argv[]) {
     NS_LOG_INFO("Max users limit: " << maxUsers);
 
     // Load tweet data
-    std::string inputCsv = "scratch/Twitter_Data.csv";
+    // Default input CSV (can be overridden via CLI flag --input)
+    // `inputCsv` may be overridden by the CommandLine option --input
+    NS_LOG_INFO("Using input CSV: " << inputCsv);
     std::vector<TwitterData> tweets = LoadTwitterDataFromCSV(inputCsv);
     if (tweets.empty()) {
         NS_LOG_ERROR("Failed to load tweet data");
@@ -396,32 +403,50 @@ int main(int argc, char *argv[]) {
 
     // WiFi Setup
     WifiHelper wifi;
+    wifi.SetStandard(WIFI_STANDARD_80211n);  // Use 802.11n for better range
+    
     YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
     YansWifiPhyHelper phy;
     phy.SetChannel(channel.Create());
+    // Increase transmit power for better coverage
+    phy.Set("TxPowerStart", DoubleValue(20.0));  // dBm
+    phy.Set("TxPowerEnd", DoubleValue(20.0));
+    
     WifiMacHelper mac;
     Ssid ssid = Ssid("bot-network");
 
-    // Mobility for WiFi gateway 
-    //TODO: need to update the KPI for mobility
-    MobilityHelper wifiMobility;
-    Ptr<ListPositionAllocator> wifiGwPos = CreateObject<ListPositionAllocator>();
-    wifiGwPos->Add(Vector(50.0, 50.0, 5.0)); 
-    wifiMobility.SetPositionAllocator(wifiGwPos);
-    wifiMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
-    wifiMobility.Install(wifiGw);
+    // Calculate grid dimensions based on number of bots
+    // Keep bots within ~50m of WiFi AP for reliable coverage
+    uint32_t numBots = botNodes.GetN();
+    uint32_t gridWidth = static_cast<uint32_t>(std::ceil(std::sqrt(numBots)));
+    double botSpacing = std::min(10.0, 50.0 / std::max(1u, gridWidth));  // Scale spacing to fit in ~50m radius
     
-    // Bots - stationary (1st quad in grid)
+    // Bots - stationary, positioned in grid around WiFi AP
     MobilityHelper botMobility;
+    double gridSize = gridWidth * botSpacing;
+    double gridStartX = 50.0 - gridSize / 2.0;  // Center grid at (50, 50)
+    double gridStartY = 50.0 - gridSize / 2.0;
+    
     botMobility.SetPositionAllocator("ns3::GridPositionAllocator",
-                                    "MinX", DoubleValue(0.0),
-                                    "MinY", DoubleValue(0.0),
-                                    "DeltaX", DoubleValue(20.0),
-                                    "DeltaY", DoubleValue(20.0),
-                                    "GridWidth", UintegerValue(5),
+                                    "MinX", DoubleValue(gridStartX),
+                                    "MinY", DoubleValue(gridStartY),
+                                    "DeltaX", DoubleValue(botSpacing),
+                                    "DeltaY", DoubleValue(botSpacing),
+                                    "GridWidth", UintegerValue(gridWidth),
                                     "LayoutType", StringValue("RowFirst"));
     botMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     botMobility.Install(botNodes);
+    
+    NS_LOG_INFO("Bot grid: " << gridWidth << "x" << gridWidth << " with " << botSpacing 
+                << "m spacing, centered at (50,50)");
+
+    // Mobility for WiFi gateway - positioned at center of bot grid
+    MobilityHelper wifiMobility;
+    Ptr<ListPositionAllocator> wifiGwPos = CreateObject<ListPositionAllocator>();
+    wifiGwPos->Add(Vector(50.0, 50.0, 5.0));  // Center of bot grid
+    wifiMobility.SetPositionAllocator(wifiGwPos);
+    wifiMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    wifiMobility.Install(wifiGw);
 
     // Install WiFi devices
     mac.SetType("ns3::ApWifiMac", "Ssid", SsidValue(ssid));
@@ -521,13 +546,21 @@ int main(int argc, char *argv[]) {
     // Routing Setup
     Ipv4StaticRoutingHelper rt;
     
-    // Bot routing through WiFi
+    // Bot routing through WiFi AP
     for (uint32_t i = 0; i < botNodes.GetN(); ++i) {
-        auto s = rt.GetStaticRouting(botNodes.Get(i)->GetObject<Ipv4>());
-        s->SetDefaultRoute(botApInterfaces.GetAddress(0), 1);
+        Ptr<Ipv4> ipv4 = botNodes.Get(i)->GetObject<Ipv4>();
+        auto s = rt.GetStaticRouting(ipv4);
+        uint32_t wifiIfIndex = ipv4->GetInterfaceForDevice(botDevices.Get(i));
+        s->SetDefaultRoute(botApInterfaces.GetAddress(0), wifiIfIndex);
+        
+        // Register bot IP for KPI tracking
+        g_ipToNodeId[botInterfaces.GetAddress(i)] = botNodes.Get(i)->GetId();
+        
+        NS_LOG_INFO("Bot " << botNodes.Get(i)->GetId() 
+                    << " WiFi IP: " << botInterfaces.GetAddress(i)
+                    << " default route via " << botApInterfaces.GetAddress(0));
     }
     
-
     // Human routing through both WiFi and 5G
     for (uint32_t i = 0; i < humanNodes.GetN(); ++i) {
         Ptr<Node> hNode = humanNodes.Get(i);
@@ -542,13 +575,10 @@ int main(int argc, char *argv[]) {
         Ipv4Address wifiGwAddr = botApInterfaces.GetAddress(0);                   
         Ipv4Address epcGwAddr  = epcHelper->GetUeDefaultGatewayAddress();         
 
-        // Default route -> WiFi (for general traffic)
+        // Default route via WiFi
         s->SetDefaultRoute(wifiGwAddr, ifIndexWifi);
-
-        // Host route to server via WiFi
-        s->AddHostRouteTo(serverIp, wifiGwAddr, ifIndexWifi);
-
-        // Host route to server via 5G
+        
+        // Host route to server via 5G (alternative path)
         s->AddHostRouteTo(serverIp, epcGwAddr, ifIndex5G);
 
         // Register IPs for KPI tracking
@@ -557,24 +587,42 @@ int main(int argc, char *argv[]) {
 
         NS_LOG_INFO("Human node " << hNode->GetId()
             << " WiFi-ifIndex=" << ifIndexWifi
-            << " 5G-ifIndex=" << ifIndex5G
-            << " WiFi-GW=" << wifiGwAddr
-            << " EPC-GW=" << epcGwAddr);
+            << " 5G-ifIndex=" << ifIndex5G);
     }
 
+    // WiFi Gateway routing - forward to PGW for external traffic
+    Ptr<Ipv4> wifiGwIpv4 = wifiGw.Get(0)->GetObject<Ipv4>();
+    auto gwStatic = rt.GetStaticRouting(wifiGwIpv4);
+    uint32_t gwToPgwIf = wifiGwIpv4->GetInterfaceForDevice(p2pWifiPgwDevices.Get(0));
+    uint32_t gwToWifiIf = wifiGwIpv4->GetInterfaceForDevice(botApDevice.Get(0));
     
-    // Gateway routing
-    auto gwStatic = rt.GetStaticRouting(wifiGw.Get(0)->GetObject<Ipv4>());
-    gwStatic->SetDefaultRoute(wifiPgwInterfaces.GetAddress(1), 2);
+    // Default route to PGW for internet-bound traffic
+    gwStatic->SetDefaultRoute(wifiPgwInterfaces.GetAddress(1), gwToPgwIf);
     
-  
-    // Set up server routing through PGW
+    // Route back to WiFi subnet stays local
+    gwStatic->AddNetworkRouteTo(Ipv4Address("10.1.1.0"), Ipv4Mask("255.255.255.0"),
+                                gwToWifiIf);
+    
+    NS_LOG_INFO("WiFi-GW routes: default via PGW (if " << gwToPgwIf 
+                << "), 10.1.1.0/24 via WiFi (if " << gwToWifiIf << ")");
+
+    // PGW routing - needs route back to WiFi subnet
+    Ptr<Ipv4> pgwIpv4 = pgw->GetObject<Ipv4>();
+    auto pgwStatic = rt.GetStaticRouting(pgwIpv4);
+    int32_t pgwToWifiGwIf = pgwIpv4->GetInterfaceForAddress(wifiPgwInterfaces.GetAddress(1));
+    
+    if (pgwToWifiGwIf >= 0) {
+        pgwStatic->AddNetworkRouteTo(Ipv4Address("10.1.1.0"), Ipv4Mask("255.255.255.0"),
+                                     wifiPgwInterfaces.GetAddress(0), pgwToWifiGwIf);
+        NS_LOG_INFO("PGW route: 10.1.1.0/24 -> " << wifiPgwInterfaces.GetAddress(0) 
+                    << " via interface " << pgwToWifiGwIf);
+    } else {
+        NS_LOG_ERROR("Failed to find PGW interface for WiFi-GW link!");
+    }
+    
+    // Server routing - default via PGW
     auto serverStatic = rt.GetStaticRouting(server.Get(0)->GetObject<Ipv4>());
-    serverStatic->SetDefaultRoute(ifPgwServer.GetAddress(0), 1);  // Route through PGW
-    
-    // Add specific routes for client networks
-    serverStatic->AddNetworkRouteTo(Ipv4Address("10.1.1.0"), Ipv4Mask("255.255.255.0"),
-                                   ifPgwServer.GetAddress(0), 1);
+    serverStatic->SetDefaultRoute(ifPgwServer.GetAddress(0), 1);
 
     // Initialize KPIs
     int botIdx = 0, humanIdx = 0;
@@ -587,10 +635,6 @@ int main(int argc, char *argv[]) {
         if (mapping.second == 0) {
             nodeId = botNodes.Get(botIdx)->GetId();
             networkType = "WiFi";
-            
-            // Map IP to node ID
-            Ipv4Address addr = botInterfaces.GetAddress(botIdx);
-            g_ipToNodeId[addr] = nodeId;
             
             botIdx++;
         } else {
@@ -623,6 +667,7 @@ int main(int argc, char *argv[]) {
     uint16_t serverPort = 8080;
     double simDuration = 60.0; 
     
+    // TCP sink for all clients (both humans and bots - Twitter uses HTTPS/TCP)
     PacketSinkHelper packetSinkHelper("ns3::TcpSocketFactory", 
                                      InetSocketAddress(Ipv4Address::GetAny(), serverPort));
     ApplicationContainer sinkApps = packetSinkHelper.Install(server.Get(0));
@@ -658,6 +703,8 @@ int main(int argc, char *argv[]) {
         int label = userMapping[i].second;
 
         Ptr<Node> clientNode = (label == 1) ? humanNodes.Get(humanIdx) : botNodes.Get(botIdx);
+        
+        // All clients use TCP (Twitter uses HTTPS which is TCP-based)
         Ptr<Socket> socket = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
         clientSockets[i] = socket;
 
@@ -669,19 +716,41 @@ int main(int argc, char *argv[]) {
         if (label == 1) {
             // WiFi socket
             socket->BindToNetDevice(humanWifiDevices.Get(humanIdx));
-            socket->Connect(remoteAddress);
-            NS_LOG_INFO("Human node " << clientNode->GetId() << " WiFi socket bound and connected");
+            // Delay connection to allow WiFi association to complete
+            Simulator::Schedule(Seconds(0.5), [socket, remoteAddress]() {
+                socket->Connect(remoteAddress);
+            });
+            NS_LOG_INFO("Human node " << clientNode->GetId() << " WiFi socket bound, connecting at t=0.5s");
 
             // 5G socket
             Ptr<Socket> socket5G = Socket::CreateSocket(clientNode, TcpSocketFactory::GetTypeId());
             socket5G->BindToNetDevice(humanUeDevices.Get(humanIdx));
-            socket5G->Connect(remoteAddress);
+            Simulator::Schedule(Seconds(0.5), [socket5G, remoteAddress]() {
+                socket5G->Connect(remoteAddress);
+            });
             client5GSockets[i] = socket5G;
-            NS_LOG_INFO("Human node " << clientNode->GetId() << " 5G socket bound and connected");
+            NS_LOG_INFO("Human node " << clientNode->GetId() << " 5G socket bound, connecting at t=0.5s");
             humanIdx++;
         } else {
-            // Bots only use WiFi
-            socket->Connect(remoteAddress);
+            // Bots use WiFi only with TCP
+            socket->BindToNetDevice(botDevices.Get(botIdx));
+            // Delay connection to allow WiFi association to complete
+            Simulator::Schedule(Seconds(0.5), [socket, remoteAddress]() {
+                socket->Connect(remoteAddress);
+            });
+            NS_LOG_INFO("Bot " << clientNode->GetId() 
+                        << " TCP socket bound, connecting to " << serverIp 
+                        << ":" << serverPort << " at t=0.5s");
+            
+            // Log routing table
+            Ptr<Ipv4> ipv4 = clientNode->GetObject<Ipv4>();
+            NS_LOG_INFO("Bot " << clientNode->GetId() << " has " 
+                        << ipv4->GetNInterfaces() << " interfaces");
+            
+            for (uint32_t j = 0; j < ipv4->GetNInterfaces(); j++) {
+                NS_LOG_INFO("  Interface " << j << ": " 
+                            << ipv4->GetAddress(j, 0).GetLocal());
+            }
             botIdx++;
         }
 
@@ -705,6 +774,7 @@ int main(int argc, char *argv[]) {
                              ConvertTimestampToSeconds(b.tweet_timestamp);
                   });
 
+ 
         // Compute real interarrival times (IATs) between tweets
         std::vector<double> iatReal;
         for (size_t k = 1; k < userTweets.size(); ++k) {
@@ -764,7 +834,7 @@ int main(int argc, char *argv[]) {
             uint32_t headerBytes = 40;
             uint32_t baseSize = headerBytes + textBytes;
 
-            // How many packets to send for this "tweet"
+            // How many packets to send for this tweet
             int packetCount = isStorm ? stormCountDist(gen) : 1;
 
                 for (int p = 0; p < packetCount; ++p) {
@@ -804,54 +874,95 @@ int main(int argc, char *argv[]) {
 
     
 
-    // Setup NetAnim
-    NS_LOG_INFO("Setting up NetAnim...");
-    AnimationInterface anim(animFile);
-    anim.SetStartTime(Seconds(0));
-    anim.SetStopTime(Seconds(simDuration + 10.0));
-    anim.EnablePacketMetadata(); 
-    anim.UpdateNodeDescription(server.Get(0), "Server");
-    anim.UpdateNodeDescription(pgw, "PGW");
-    anim.UpdateNodeDescription(wifiGw.Get(0), "WiFi-GW");
-    anim.UpdateNodeDescription(humanGnb.Get(0), "5G-gNB");
-    
-    // Color infrastructure nodes differently
-    anim.UpdateNodeColor(server.Get(0), 0, 255, 0); // Green - server
-    anim.UpdateNodeColor(pgw, 128, 128, 128); // Gray - PGW
-    anim.UpdateNodeColor(wifiGw.Get(0), 255, 165, 0); // Orange - WiFi gateway
-    anim.UpdateNodeColor(humanGnb.Get(0), 0, 128, 128); // Teal - gNB
-    anim.UpdateNodeSize(server.Get(0)->GetId(), 5.0, 5.0);
-    anim.UpdateNodeSize(pgw->GetId(), 4.0, 4.0);
-    anim.UpdateNodeSize(wifiGw.Get(0)->GetId(), 4.0, 4.0);
-    anim.UpdateNodeSize(humanGnb.Get(0)->GetId(), 4.0, 4.0);
-    
-    for (uint32_t i = 0; i < NodeContainer::GetGlobal().GetN(); i++) {
-        Ptr<Node> node = NodeContainer::GetGlobal().Get(i);
-        uint32_t nodeId = node->GetId();
+    // Setup NetAnim (optional - uses lots of memory)
+    AnimationInterface* anim = nullptr;
+    if (enableNetAnim) {
+        NS_LOG_INFO("Setting up NetAnim...");
+        anim = new AnimationInterface(animFile);
+        anim->SetStartTime(Seconds(0));
+        anim->SetStopTime(Seconds(simDuration + 10.0));
+        anim->SetMaxPktsPerTraceFile(5000000);
+        anim->UpdateNodeDescription(server.Get(0), "Server");
+        anim->UpdateNodeDescription(pgw, "PGW");
+        anim->UpdateNodeDescription(wifiGw.Get(0), "WiFi-GW");
+        anim->UpdateNodeDescription(humanGnb.Get(0), "5G-gNB");
         
-        if (g_nodeKPIs.find(nodeId) != g_nodeKPIs.end()) {
-            NodeKPI& kpi = g_nodeKPIs[nodeId];
-            anim.UpdateNodeDescription(node, kpi.nodeType + "-" + std::to_string(nodeId));
+        // Color infrastructure nodes differently
+        anim->UpdateNodeColor(server.Get(0), 0, 255, 0); // Green - server
+        anim->UpdateNodeColor(pgw, 128, 128, 128); // Gray - PGW
+        anim->UpdateNodeColor(wifiGw.Get(0), 255, 165, 0); // Orange - WiFi gateway
+        anim->UpdateNodeColor(humanGnb.Get(0), 0, 128, 128); // Teal - gNB
+        anim->UpdateNodeSize(server.Get(0)->GetId(), 5.0, 5.0);
+        anim->UpdateNodeSize(pgw->GetId(), 4.0, 4.0);
+        anim->UpdateNodeSize(wifiGw.Get(0)->GetId(), 4.0, 4.0);
+        anim->UpdateNodeSize(humanGnb.Get(0)->GetId(), 4.0, 4.0);
+        
+        for (uint32_t i = 0; i < NodeContainer::GetGlobal().GetN(); i++) {
+            Ptr<Node> node = NodeContainer::GetGlobal().Get(i);
+            uint32_t nodeId = node->GetId();
             
-            if (kpi.nodeType == "human") {
-                anim.UpdateNodeColor(node, 0, 0, 255); // Blue
-                anim.UpdateNodeSize(nodeId, 3.0, 3.0);
+            if (g_nodeKPIs.find(nodeId) != g_nodeKPIs.end()) {
+                NodeKPI& kpi = g_nodeKPIs[nodeId];
+                anim->UpdateNodeDescription(node, kpi.nodeType + "-" + std::to_string(nodeId));
+                
+                if (kpi.nodeType == "human") {
+                    anim->UpdateNodeColor(node, 0, 0, 255); // Blue
+                    anim->UpdateNodeSize(nodeId, 3.0, 3.0);
+                } else {
+                    anim->UpdateNodeColor(node, 255, 0, 0); // Red
+                    anim->UpdateNodeSize(nodeId, 2.5, 2.5);
+                }
             } else {
-                anim.UpdateNodeColor(node, 255, 0, 0); // Red
-                anim.UpdateNodeSize(nodeId, 2.5, 2.5);
+                // Label EPC infrastructure nodes (SGW, MME)
+                if (nodeId != server.Get(0)->GetId() && 
+                    nodeId != pgw->GetId() && 
+                    nodeId != wifiGw.Get(0)->GetId() && 
+                    nodeId != humanGnb.Get(0)->GetId()) {
+                    static int epcNodeCount = 0;
+                    std::string epcLabel = (epcNodeCount == 0) ? "SGW" : "MME";
+                    epcNodeCount++;
+                    anim->UpdateNodeDescription(node, epcLabel);
+                    anim->UpdateNodeColor(node, 100, 100, 100); // Dark gray
+                    anim->UpdateNodeSize(nodeId, 2.0, 2.0);
+                }
             }
         }
+    } else {
+        NS_LOG_INFO("NetAnim disabled (use --enableNetAnim=true to enable)");
     }
 
     // Setup FlowMonitor
     FlowMonitorHelper flowmon;
     Ptr<FlowMonitor> monitor = flowmon.InstallAll();
 
-    // Enable tracing 
-    NS_LOG_INFO("Enabling PCAP tracing...");
-    phy.EnablePcapAll(pcapDir + "/wifi", true);
-    p2p.EnablePcapAll(pcapDir + "/p2p", true);
-    nrHelper->EnableTraces();
+    // Enable tracing (optional - significantly slows down simulation)
+    if (enableTracing) {
+        NS_LOG_INFO("Enabling PCAP and NR tracing (this will slow down simulation)...");
+        
+        // Bot WiFi devices - labeled as "bot-wifi"
+        for (uint32_t i = 0; i < botDevices.GetN(); ++i) {
+            std::stringstream ss;
+            ss << pcapDir << "/bot-wifi-" << i;
+            phy.EnablePcap(ss.str(), botDevices.Get(i), true);
+        }
+        
+        // Human WiFi devices - labeled as human-wifi
+        for (uint32_t i = 0; i < humanWifiDevices.GetN(); ++i) {
+            std::stringstream ss;
+            ss << pcapDir << "/human-wifi-" << i;
+            phy.EnablePcap(ss.str(), humanWifiDevices.Get(i), true);
+        }
+        
+        // P2P links (carry 5G traffic for humans)
+        p2p.EnablePcapAll(pcapDir + "/p2p", true);
+        
+        // NR (5G) traces - very slow!
+        nrHelper->EnableTraces();
+    } else {
+        NS_LOG_INFO("Tracing disabled (use --enableTracing=true to enable)");
+    }
+
+   
 
     // Run sim
     NS_LOG_INFO("Running simulation for " << (simDuration + 10.0) << " seconds...");
@@ -874,6 +985,13 @@ int main(int argc, char *argv[]) {
     std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
 
     // Update KPIs from flow monitor stats (aggregate across flows per node)
+    for (auto& pair : g_nodeKPIs) {
+        pair.second.txPackets = 0;
+        pair.second.rxPackets = 0;
+        pair.second.totalBytes = 0;
+    }
+
+    // Aggregate flow statistics per node
     for (auto& flow : stats) {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(flow.first);
         FlowMonitor::FlowStats& fs = flow.second;
@@ -882,43 +1000,65 @@ int main(int argc, char *argv[]) {
         if (it != g_ipToNodeId.end()) {
             uint32_t nodeId = it->second;
             NodeKPI& kpi = g_nodeKPIs[nodeId];
+            
+            NS_LOG_INFO("Flow for Node " << nodeId << " (" << kpi.nodeType << "):");
+            NS_LOG_INFO("  TxPackets: " << fs.txPackets << ", RxPackets: " << fs.rxPackets);
 
-            // Accumulate packet and byte counts
+            // Accumulate actual sent/received counts
             uint32_t prevRx = kpi.rxPackets;
-
             kpi.txPackets += fs.txPackets;
             kpi.rxPackets += fs.rxPackets;
-            kpi.lostPackets += fs.lostPackets;
-            kpi.totalPackets = kpi.txPackets;
             kpi.totalBytes += fs.txBytes;
+            
 
-            // Weighted average delay/jitter over all flows for this node
+            // Weighted average delay/jitter
             if (fs.rxPackets > 0) {
-                double flowAvgDelayMs =
-                    (fs.delaySum.GetSeconds() / fs.rxPackets) * 1000.0;
+                double flowAvgDelayMs = (fs.delaySum.GetSeconds() / fs.rxPackets) * 1000.0;
                 double flowAvgJitterMs = 0.0;
                 if (fs.rxPackets > 1) {
-                    flowAvgJitterMs =
-                        (fs.jitterSum.GetSeconds() / (fs.rxPackets - 1)) * 1000.0;
+                    flowAvgJitterMs = (fs.jitterSum.GetSeconds() / (fs.rxPackets - 1)) * 1000.0;
                 }
 
-                uint32_t newRx = prevRx + fs.rxPackets;
-                if (newRx == fs.rxPackets) {
-                    // First time we see this node
+                uint32_t newRx = kpi.rxPackets;
+                if (prevRx == 0) {
                     kpi.avgDelay = flowAvgDelayMs;
                     kpi.avgJitter = flowAvgJitterMs;
                 } else {
-                    // Combine old + new using weighted average by rxPackets
-                    kpi.avgDelay =
-                        (kpi.avgDelay * prevRx + flowAvgDelayMs * fs.rxPackets) /
-                        static_cast<double>(newRx);
-                    kpi.avgJitter =
-                        (kpi.avgJitter * prevRx + flowAvgJitterMs * fs.rxPackets) /
-                        static_cast<double>(newRx);
+                    kpi.avgDelay = (kpi.avgDelay * prevRx + flowAvgDelayMs * fs.rxPackets) / 
+                                static_cast<double>(newRx);
+                    kpi.avgJitter = (kpi.avgJitter * prevRx + flowAvgJitterMs * fs.rxPackets) / 
+                                static_cast<double>(newRx);
                 }
             }
         }
     }
+
+    NS_LOG_INFO("\n FINAL NODE STATISTICS ");
+    for (auto& pair : g_nodeKPIs) {
+        NodeKPI& kpi = pair.second;
+
+        if (kpi.txPackets > 0) {
+            kpi.lostPackets = (kpi.txPackets > kpi.rxPackets) ? 
+                            (kpi.txPackets - kpi.rxPackets) : 0;
+            kpi.packetLossRate = static_cast<double>(kpi.lostPackets) / 
+                                static_cast<double>(kpi.txPackets);
+        } else {
+            kpi.lostPackets = 0;
+            kpi.packetLossRate = 0.0;
+        }
+
+        // Calculate throughput
+        if (kpi.rxPackets > 0 && simDuration > 0.0) {
+            kpi.throughput = (kpi.totalBytes * 8.0) / simDuration;
+        }
+        
+        NS_LOG_INFO("Node " << kpi.nodeId << " [" << kpi.username << "] (" << kpi.nodeType << "):");
+        NS_LOG_INFO("  TX=" << kpi.txPackets << ", RX=" << kpi.rxPackets 
+                    << ", Lost=" << kpi.lostPackets);
+        NS_LOG_INFO("  Loss Rate=" << (kpi.packetLossRate * 100) << "%");
+        NS_LOG_INFO("  Throughput=" << (kpi.throughput/1000) << " Kbps");
+    }
+
 
     // Finalize packet loss rate and throughput per node
     for (auto& pair : g_nodeKPIs) {
@@ -926,7 +1066,8 @@ int main(int argc, char *argv[]) {
 
         if (kpi.txPackets > 0) {
             kpi.packetLossRate =
-                static_cast<double>(kpi.lostPackets) / static_cast<double>(kpi.txPackets);
+            static_cast<double>(kpi.txPackets - kpi.rxPackets) / 
+            static_cast<double>(kpi.txPackets);
         }
 
         if (kpi.rxPackets > 0 && simDuration > 0.0) {
@@ -969,16 +1110,18 @@ int main(int argc, char *argv[]) {
     }
     kpiFile.close();
 
-    // Export FlowMonitor XML
-    std::string flowmonFile = "flowmon-results.xml";
-    monitor->SerializeToXmlFile(flowmonFile, true, true);
-
-    NS_LOG_INFO("\n=== Output Files Generated ===");
+    NS_LOG_INFO("\nOutput Files Generated");
     NS_LOG_INFO("1. KPI CSV: " << csvFile);
-    NS_LOG_INFO("2. NetAnim: " << animFile);
-    NS_LOG_INFO("3. FlowMonitor: " << flowmonFile);
-    NS_LOG_INFO("4. PCAP files: " << pcapDir << "/");
-    NS_LOG_INFO("==============================");
+    if (enableNetAnim) {
+        NS_LOG_INFO("2. NetAnim: " << animFile);
+    } else {
+        NS_LOG_INFO("2. NetAnim: DISABLED");
+    }
+
+    // Cleanup
+    if (anim != nullptr) {
+        delete anim;
+    }
 
     Simulator::Destroy();
     NS_LOG_INFO("Simulation completed successfully!");
