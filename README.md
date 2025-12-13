@@ -124,5 +124,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+NetAnim is used to view the twitter-bot-detection.xml:
+https://www.nsnam.org/wiki/NetAnim
+
+
 
 
