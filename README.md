@@ -124,7 +124,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 Here are a few examples:
-![Latency Comparison](outputs/average_delay_bot_vs_human.png)
+![Latency Comparison](outputs/bot_vs_human_analysis.png)
 
 
 NetAnim is used to view the twitter-bot-detection.xml:
