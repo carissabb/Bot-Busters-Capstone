@@ -27,16 +27,15 @@ All tweet activity is generated from real timestamps by converting them into int
 These are the dependencies used for this project:
 
 - **NS3** — 3.45 (not allinone)
+- 5G LENA https://cttc-lena.gitlab.io/nr/html/ (additional ns-3 module)
 - **Ubuntu** — 24.04
-- **WSL** — WSL2
+- **WSL** — WSL2 (several memory issues with WSL2, for better performance deployments from an Ubuntu VM is ideal)
 - **VSCode**
-
-By default NS3 works in C++ so there is no need to additionally install it.
 
 ---
 
 ## Input Data & Project Structure
-
+This simulation does not do input validation. You MUST use this file to generate simulations.
 **Required input file:**
 - `scratch/Twitter_Data.csv`  
 - Required columns:  
@@ -105,10 +104,17 @@ Additional outputs:
 ./ns3 run "full_twitter_sim"
 ```
 
-### (Optional) Run with custom number of users
+### (Optional) Run with custom number of users (default=20)
 ```bash
 ./ns3 run "full_twitter_sim --maxUsers=10"
 ```
+
+Additionally, users are able to opt out of the pcap tracing or animation generation. These options are DISABLED by default in order to save resources and memory. To enable 
+### (Optional) Run with tracing and netanim enabled
+```bash
+./ns3 run "full_twitter_sim --maxUsers=10 --enableTracing=true --enableNetAnim=true"
+```
+
 ## Viewing the Results
 Using the notebook in this repository, users will be able to create visualizations based on the outputted bot_detection_kpis.csv file from the sim. Below are commands to get started and run the code in the Jupyter Notebook.
 
